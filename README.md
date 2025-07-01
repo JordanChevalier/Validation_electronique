@@ -1,2 +1,2 @@
 # Validation_electronique
-Ce répertoire va servir de depot pour toute la partie validation électronique
+Ce répertoire va servir de dépôt pour toute la partie validation électronique
