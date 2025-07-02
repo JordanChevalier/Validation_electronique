@@ -1,19 +1,12 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <SPI.h>
 #include <BluetoothSerial.h>
-#include <math.h>
 
 // === Pin Definitions ===
-#define LED_VERTE 14    // CMD_LED_GREEN
-#define LED_ROUGE 15    // CMD_LED_RED
-#define BUZZER 13       // Buzzer-PWM
-#define NTC1_PIN 26     // NTC 1 analog input
-#define NTC2_PIN 25     // NTC 2 analog input
-
-// === PWM for Buzzer ===
-#define BUZZER_CHANNEL 0
-#define PWM_FREQUENCY 2000
-#define PWM_RESOLUTION 8
+#define LED_VERTE 14    // Green LED for HMI
+#define LED_ROUGE 15    // Red LED for HMI
+#define TMP126_CS 5     // TMP126 chip select (SPI)
 
 // === INA237 I²C Address and Registers ===
 #define INA237_ADDR 0x40
@@ -22,63 +15,156 @@
 #define INA237_REG_VBUS 0x02
 #define INA237_REG_CURRENT 0x04
 #define INA237_REG_POWER 0x05
+#define INA237_REG_CAL 0x06
 
-// === NTC Parameters ===
-#define R1 10000.0      // 10kΩ series resistor
-#define R0 10000.0      // NTC resistance at 25°C
-#define BETA 3950.0     // NTC beta coefficient
-#define T0 298.15       // Reference temperature (25°C in Kelvin)
+// === Shunt Resistor ===
+#define SHUNT_RESISTOR 0.01 // 10mΩ shunt resistor
+#define CURRENT_LSB 0.000005 // 5µA/LSB
+
+// === SPI Settings for TMP126 ===
+#define SPI_CLK 1000000 // 1MHz SPI clock
+#define TMP126_REG_TEMP 0x00 // Temperature register
+#define TMP126_REG_CONFIG 0x01 // Configuration register
+#define TMP126_REG_DEVICE_ID 0x0F // Device ID register
 
 // === Bluetooth ===
 BluetoothSerial SerialBT;
 
-void setup() {
-  // Initialize Serial for debugging
-  Serial.begin(115200);
-  
-  // Initialize Bluetooth
-  SerialBT.begin("ESP32_Sensor"); // Bluetooth device name
-  Serial.println("Bluetooth started. Pair with 'ESP32_Sensor'.");
-  SerialBT.println("Bluetooth started. Pair with 'ESP32_Sensor'.");
+// === Function Prototypes ===
+void initINA237();
+bool initTMP126();
+float readINA237Register(uint8_t reg);
+float readTMP126Temperature();
+void sendData(String data);
 
-  // Initialize I²C (SDA = IO21, SCL = IO22)
+// === Setup ===
+void setup() {
+  // Initialize Serial
+  Serial.begin(115200);
+  Serial.println("System initializing...");
+
+  // Initialize Bluetooth
+  SerialBT.begin("ESP32_Sensor");
+  Serial.println("Bluetooth initialized. Pair with 'ESP32_Sensor'.");
+  SerialBT.println("Bluetooth initialized. Pair with 'ESP32_Sensor'.");
+
+  // Initialize I²C (SDA=21, SCL=22)
   Wire.begin(21, 22);
   delay(100);
 
-  // Initialize INA237
+  // Initialize SPI (VSPI: SCLK=18, MOSI=23, MISO=19, CS=5)
+  SPI.begin(18, 19, 23, TMP126_CS);
+  pinMode(TMP126_CS, OUTPUT);
+  digitalWrite(TMP126_CS, HIGH);
+
+  // Initialize Sensors
+  initINA237();
+  if (!initTMP126()) {
+    Serial.println("TMP126 initialization failed. Continuing with limited functionality.");
+    SerialBT.println("TMP126 initialization failed. Continuing with limited functionality.");
+  } else {
+    Serial.println("TMP126 initialized.");
+    SerialBT.println("TMP126 initialized.");
+  }
+
+  // Initialize LEDs
+  pinMode(LED_VERTE, OUTPUT);
+  pinMode(LED_ROUGE, OUTPUT);
+  digitalWrite(LED_VERTE, LOW);
+  digitalWrite(LED_ROUGE, LOW);
+
+  Serial.println("System initialized.");
+  SerialBT.println("System initialized.");
+}
+
+// === Initialize INA237 ===
+void initINA237() {
+  // Configure INA237: 12-bit, 1.1ms conversion, continuous mode, ±163.84mV shunt range
   Wire.beginTransmission(INA237_ADDR);
   Wire.write(INA237_REG_CONFIG);
-  Wire.write(0x4C); // 12-bit, 1.1ms conversion, continuous mode
-  Wire.write(0x1F); // ±163.84mV shunt range
+  Wire.write(0x41); // AVG=1, VBUS_CT=1.1ms, VSH_CT=1.1ms, MODE=continuous
+  Wire.write(0x9F); // Shunt range ±163.84mV
   if (Wire.endTransmission() != 0) {
     Serial.println("INA237 not detected!");
     SerialBT.println("INA237 not detected!");
     while (1);
   }
-  Serial.println("INA237 detected.");
-  SerialBT.println("INA237 detected.");
 
-  // Initialize LEDs
-  pinMode(LED_VERTE, OUTPUT);
-  pinMode(LED_ROUGE, OUTPUT);
+  // Calibrate INA237: Cal = 0.00512 / (Current_LSB * Rshunt)
+  uint16_t cal = (uint16_t)(0.00512 / (CURRENT_LSB * SHUNT_RESISTOR));
+  Wire.beginTransmission(INA237_ADDR);
+  Wire.write(INA237_REG_CAL);
+  Wire.write((cal >> 8) & 0xFF); // MSB
+  Wire.write(cal & 0xFF);       // LSB
+  if (Wire.endTransmission() != 0) {
+    Serial.println("INA237 calibration failed!");
+    SerialBT.println("INA237 calibration failed!");
+    while (1);
+  }
 
-  // Initialize PWM for buzzer
-  ledcSetup(BUZZER_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcAttachPin(BUZZER, BUZZER_CHANNEL);
-  ledcWrite(BUZZER_CHANNEL, 0); // Silence buzzer
-
-  // Turn off LEDs at startup
-  digitalWrite(LED_VERTE, LOW);
-  digitalWrite(LED_ROUGE, LOW);
-
-  // Configure ADC
-  analogReadResolution(12); // 12-bit resolution (0–4095)
+  Serial.println("INA237 initialized.");
+  SerialBT.println("INA237 initialized.");
 }
 
+// === Initialize Каждый TMP126 ===
+bool initTMP126() {
+  // Check Device ID
+  digitalWrite(TMP126_CS, LOW);
+  delayMicroseconds(1); // t_CSS = 50ns min
+  SPI.beginTransaction(SPISettings(SPI_CLK, MSBFIRST, SPI_MODE0));
+  SPI.transfer(TMP126_REG_DEVICE_ID); // Select device ID register
+  uint8_t msb = SPI.transfer(0x00);
+  uint8_t lsb = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(TMP126_CS, HIGH);
+  delayMicroseconds(1); // t_CSH = 50ns min
+
+  uint16_t device_id = (msb << 8) | lsb;
+  Serial.println("TMP126 Device ID: 0x" + String(device_id, HEX));
+  SerialBT.println("TMP126 Device ID: 0x" + String(device_id, HEX));
+  if (device_id != 0x0126) {
+    Serial.println("TMP126 not detected!");
+    SerialBT.println("TMP126 not detected!");
+    return false;
+  }
+
+  // Configure TMP126: Continuous conversion mode (MOD=11)
+  digitalWrite(TMP126_CS, LOW);
+  delayMicroseconds(1);
+  SPI.beginTransaction(SPISettings(SPI_CLK, MSBFIRST, SPI_MODE0));
+  SPI.transfer(0x80 | TMP126_REG_CONFIG); // Write to config register
+  SPI.transfer(0x0C); // MOD[1:0]=11 (continuous), others default
+  SPI.transfer(0x00); // Reserved
+  SPI.endTransaction();
+  digitalWrite(TMP126_CS, HIGH);
+  delayMicroseconds(1);
+
+  // Verify configuration
+  digitalWrite(TMP126_CS, LOW);
+  delayMicroseconds(1);
+  SPI.beginTransaction(SPISettings(SPI_CLK, MSBFIRST, SPI_MODE0));
+  SPI.transfer(TMP126_REG_CONFIG); // Read config
+  msb = SPI.transfer(0x00);
+  lsb = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(TMP126_CS, HIGH);
+  delayMicroseconds(1);
+
+  Serial.println("TMP126 Config: 0x" + String(msb, HEX) + String(lsb, HEX));
+  SerialBT.println("TMP126 Config: 0x" + String(msb, HEX) + String(lsb, HEX));
+  if ((msb & 0x0C) != 0x0C) {
+    return false;
+  }
+  return true;
+}
+
+// === Read INA237 Register ===
 float readINA237Register(uint8_t reg) {
   Wire.beginTransmission(INA237_ADDR);
   Wire.write(reg);
-  Wire.endTransmission(false);
+  if (Wire.endTransmission(false) != 0) {
+    return -9999.0; // I²C error
+  }
   Wire.requestFrom(INA237_ADDR, 2);
   if (Wire.available() >= 2) {
     uint16_t value = (Wire.read() << 8) | Wire.read();
@@ -87,36 +173,55 @@ float readINA237Register(uint8_t reg) {
     }
     return value;
   }
-  return -9999.0; // Error
+  return -9999.0; // Read error
 }
 
-float readNTCTemperature(int pin) {
-  int analogValue = analogRead(pin);
-  float voltage = (analogValue / 4095.0) * 3.3; // 3.3V reference
-  if (voltage < 0.01 || voltage > 3.29) return -9999.0; // Invalid reading
-  float rNTC = R1 * (3.3 / voltage - 1); // NTC resistance
-  float ln = log(rNTC / R0);
-  float tempK = 1.0 / (1.0 / T0 + ln / BETA); // Steinhart-Hart
-  return tempK - 273.15; // Convert to °C
+// === Read TMP126 Temperature ===
+float readTMP126Temperature() {
+  digitalWrite(TMP126_CS, LOW);
+  delayMicroseconds(1);
+  SPI.beginTransaction(SPISettings(SPI_CLK, MSBFIRST, SPI_MODE0));
+  SPI.transfer(TMP126_REG_TEMP); // Select temperature register
+  uint8_t msb = SPI.transfer(0x00);
+  uint8_t lsb = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(TMP126_CS, HIGH);
+  delayMicroseconds(1);
+
+  uint16_t raw = (msb << 8) | lsb;
+  Serial.println("TMP126 Raw: 0x" + String(raw, HEX));
+  SerialBT.println("TMP126 Raw: 0x" + String(raw, HEX));
+  raw >>= 2; // 14-bit data
+  float temp_C = raw * 0.03125; // 0.03125°C/LSB
+  if (temp_C < -55 || temp_C > 150) {
+    return -9999.0; // Invalid reading
+  }
+  return temp_C;
 }
 
+// === Send Data ===
+void sendData(String data) {
+  Serial.println(data);
+  SerialBT.println(data);
+}
+
+// === Main Loop ===
 void loop() {
-  // Turn on LEDs and buzzer
+  // Turn on LEDs
   digitalWrite(LED_VERTE, HIGH);
   digitalWrite(LED_ROUGE, HIGH);
-  ledcWrite(BUZZER_CHANNEL, 128); // Buzzer at 50% PWM
+  String data = "[HMI] LED ON\t";
 
-  // Read INA237 data
-  String data = "[IHM] LED et buzzer ON\t";
+  // Read INA237
   float vbus = readINA237Register(INA237_REG_VBUS);
   float vshunt = readINA237Register(INA237_REG_VSHUNT);
   float current = readINA237Register(INA237_REG_CURRENT);
   float power = readINA237Register(INA237_REG_POWER);
 
   if (vbus != -9999.0 && vshunt != -9999.0 && current != -9999.0 && power != -9999.0) {
-    float tension_V = vbus * 0.0001; // 100µV/LSB
-    float courant_mA = current * 0.005; // 5µA/LSB for 0.01Ω shunt
-    float puissance_mW = power * 0.125; // 125µW/LSB
+    float tension_V = vbus * 0.003125; // 3.125mV/LSB
+    float courant_mA = current * 0.005; // 5µA/LSB
+    float puissance_mW = power * 0.125; // 25 × Current_LSB
     data += "Tension = " + String(tension_V, 2) + " V\t";
     data += "Courant = " + String(courant_mA, 2) + " mA\t";
     data += "Puissance = " + String(puissance_mW, 2) + " mW\t";
@@ -124,32 +229,23 @@ void loop() {
     data += "Erreur de lecture INA237\t";
   }
 
-  // Read NTC temperatures
-  float temp1_C = readNTCTemperature(NTC1_PIN);
-  float temp2_C = readNTCTemperature(NTC2_PIN);
-  if (temp1_C > -50 && temp1_C < 150) {
-    data += "Temp NTC1 = " + String(temp1_C, 2) + " °C\t";
+  // Read TMP126
+  float temp_C = readTMP126Temperature();
+  if (temp_C != -9999.0) {
+    data += "Temp = " + String(temp_C, 2) + " °C";
   } else {
-    data += "Erreur NTC1\t";
-  }
-  if (temp2_C > -50 && temp2_C < 150) {
-    data += "Temp NTC2 = " + String(temp2_C, 2) + " °C";
-  } else {
-    data += "Erreur NTC2";
+    data += "Erreur TMP126";
   }
 
-  // Print to Serial and Bluetooth
-  Serial.println(data);
-  SerialBT.println(data);
+  // Send data
+  sendData(data);
 
   delay(2000);
 
-  // Turn off LEDs and buzzer
+  // Turn off LEDs
   digitalWrite(LED_VERTE, LOW);
   digitalWrite(LED_ROUGE, LOW);
-  ledcWrite(BUZZER_CHANNEL, 0);
-  Serial.println("[IHM] LED et buzzer OFF\n");
-  SerialBT.println("[IHM] LED et buzzer OFF\n");
+  sendData("[HMI] LED OFF");
 
   delay(2000);
 }
